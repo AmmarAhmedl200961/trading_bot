@@ -1,0 +1,5 @@
+alpaca-py
+websockets
+sqlalchemy
+python-dotenv
+pytz
