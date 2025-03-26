@@ -10,6 +10,8 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     StopLimitOrderRequest,
     GetOrdersRequest,
+    TrailingStopOrderRequest,
+    StopOrderRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, QueryOrderStatus
 from sqlalchemy import (
@@ -24,12 +26,12 @@ from sqlalchemy import (
     text,
     inspect,
 )
-import sqlalchemy
 from sqlalchemy.pool import QueuePool
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from dotenv import load_dotenv
 import os
-import time
+import pandas as pd
+# import pandas_ta as ta
 
 # Load environment variables from .env file
 load_dotenv()
@@ -81,26 +83,31 @@ class XRPStreamer:
             seconds=5
         )  # Reduced from 15 minutes to 5 seconds
 
-        # Fee structure - adjusted to realistic Alpaca fees
-        self.trading_fee_pct = 0.004  # 0.4% trading fee (more realistic than 1.6%)
+        # Fee structure
+        self.trading_fee_pct = 0.016  # 1.6% trading fee
         self.network_fee_xrp = 0.56  # XRP network fee
 
-        # Adjusted thresholds to account for fees
-        self.price_threshold = 0.025  # Wait for 2.5% price movement to enter
-        self.take_profit_threshold = 0.035  # Take profit at 3.5% (covers fees + profit)
-        self.stop_loss_threshold = 0.015  # Stop loss at 1.5% to minimize losses
+        # Dynamic thresholds using Average True Range (ATR)
+        self.atr_period = 14
+        self.risk_multiplier = 1.5  # Adjust aggressiveness
+        self.take_profit_multiplier = 2.0
+        self.stop_loss_multiplier = 1.0
+
+        # These will be replaced with dynamic values from ATR
+        self.take_profit_threshold = 0.035  # Will be dynamically set
+        self.stop_loss_threshold = 0.015  # Will be dynamically set
 
         # Position sizing
-        self.min_position_value = 4000  # Further reduced minimum trade size
-        self.max_position_size = (
-            25000  # Maximum position size based on available balance
-        )
-        self.position_value = 20000  # Standard position size
+        self.min_position_value = 4000
+        self.max_position_size = 25000
+        self.position_value = 20000
+        self.risk_percentage = 0.015  # Risk 1.5% of account equity per trade
 
-        # Trading intervals
+        # Order management
+        self.max_open_orders = 2
+        self.order_expiry = timedelta(minutes=15)
         self.last_order_time = None
-        self.min_order_interval = timedelta(minutes=2)  # Minimum time between trades
-        self.last_logged_price = None
+        self.min_order_interval = timedelta(minutes=2)
 
         # Tracking
         self.total_fees_paid = 0
@@ -122,15 +129,6 @@ class XRPStreamer:
         # Add safety checks
         self.max_retries = 3
         self.retry_delay = 5
-
-        # Add tracking for last logged trading plan to avoid redundant logs
-        self.last_trading_plan_log = datetime.now() - timedelta(minutes=5)
-        self.last_order_status = {}  # To track order status changes
-
-        # Add configuration for logging intervals
-        self.position_log_interval = 60  # seconds between position status logs
-        self.price_log_interval = 30  # seconds between price update logs
-        self.bar_log_interval = 60  # seconds between bar data logs
 
     def init_database(self):
         """Initialize PostgreSQL database connection and tables"""
@@ -168,14 +166,12 @@ class XRPStreamer:
                 Column("timestamp", DateTime),
             )
 
-            # Define orders table with unique constraint on order_id
+            # Define orders table
             self.orders = Table(
                 "orders",
                 metadata,
                 Column("id", Integer, primary_key=True),
-                Column(
-                    "order_id", String, nullable=False, unique=True
-                ),  # Added unique constraint
+                Column("order_id", String, nullable=False),
                 Column("timestamp", DateTime),
                 Column("side", String, nullable=False),
                 Column("quantity", Float),
@@ -191,88 +187,61 @@ class XRPStreamer:
             self.orders.create(self.engine, checkfirst=True)
             logger.info("Successfully initialized database connection and tables")
 
-            # Add a check to log whether price history table has data
-            with self.engine.connect() as conn:
-                result = conn.execute(
-                    sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                        self.price_history
-                    )
-                ).scalar()
-
-                if result == 0:
-                    logging.warning(
-                        "Price history database is empty. Waiting for initial quotes..."
-                    )
-                else:
-                    logging.info(f"Found {result} price records in database")
-
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
             raise
 
-    def update_account_balance(self):
-        """Update the current cash balance"""
-        account = self.trading_client.get_account()
-        self.cash_balance = min(float(account.cash), float(account.buying_power))
-        return self.cash_balance
-
-    def store_price(self, price, timestamp):
-        """Store price data in the database with improved error handling and retries"""
-        retries = 0
-        max_retries = self.max_retries
-
-        while retries < max_retries:
-            try:
-                with self.engine.connect() as conn:
-                    conn.execute(
-                        self.price_history.insert().values(
-                            symbol=self.symbol, price=price, timestamp=timestamp
-                        )
+    def store_price(self, price):
+        """Store a new price"""
+        try:
+            with self.engine.connect() as conn:
+                timestamp = datetime.now()
+                conn.execute(
+                    self.price_history.insert().values(
+                        timestamp=timestamp, price=price, symbol=self.symbol
                     )
-                    conn.commit()
-                    return True
-            except Exception as e:
-                retries += 1
-                logging.error(
-                    f"Error storing price (attempt {retries}/{max_retries}): {e}",
-                    exc_info=True,
                 )
-                if retries >= max_retries:
-                    return False
-                time.sleep(self.retry_delay)
-        return False
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error storing price: {e}")
 
     def get_last_price(self):
-        """Get the most recent price from database with improved error handling"""
-        retries = 0
-        max_retries = self.max_retries
+        """Get the most recent price from database"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(
+                    self.price_history.select()
+                    .order_by(self.price_history.c.timestamp.desc())
+                    .limit(1)
+                ).fetchone()
+                return result.price if result else None
+        except Exception as e:
+            logger.error(f"Error getting last price: {e}")
+            return None
 
-        while retries < max_retries:
-            try:
-                with self.engine.connect() as conn:
-                    result = conn.execute(
-                        self.price_history.select()
-                        .order_by(self.price_history.c.timestamp.desc())
-                        .limit(1)
-                    ).fetchone()
-
-                    if not result:
-                        logging.warning("No price data available in database")
-                        return None
-
-                    return result.price
-            except Exception as e:
-                retries += 1
-                logger.error(
-                    f"Error getting last price (attempt {retries}/{max_retries}): {e}"
+    def store_order(self, order, fees=0):
+        """Store order information in database"""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(
+                    self.orders.insert().values(
+                        order_id=order.id,
+                        timestamp=datetime.now(),
+                        side=order.side,
+                        quantity=float(order.qty),
+                        price=float(order.limit_price or 0),
+                        status=order.status,
+                        filled_qty=float(order.filled_qty or 0),
+                        filled_avg_price=float(order.filled_avg_price or 0),
+                        fees=fees,
+                    )
                 )
-                if retries >= max_retries:
-                    return None
-                time.sleep(self.retry_delay)
-        return None
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error storing order: {e}")
 
     async def update_position(self, position_info=None):
-        """Update current position information with improved null handling"""
+        """Update current position information and manage orders"""
         try:
             # Get current positions
             positions = self.trading_client.get_all_positions()
@@ -343,7 +312,7 @@ class XRPStreamer:
             else:
                 # No position - check if we should place a buy order
                 current_price = self.get_last_price()
-                if current_price is not None:  # Explicit None check
+                if current_price:
                     has_buy_order = any(
                         o.symbol == "XRP/USD" and o.side == "buy" for o in orders
                     )
@@ -363,13 +332,6 @@ class XRPStreamer:
                         f"\nTrading Mode: BUYING - Looking for entry at -2.5% below current price\n"
                         f"Target Entry: ${round(current_price * 0.975, 4):.4f}"
                     )
-                else:
-                    logging.warning(
-                        "Cannot update position: No price data available. Will retry later."
-                    )
-                    # Try to wait for more data
-                    await asyncio.sleep(10)  # Wait before retrying
-                    return
 
             # Store last price for reference
             if position_info:
@@ -378,9 +340,15 @@ class XRPStreamer:
         except Exception as e:
             logging.error(f"Error updating position: {e}")
 
+    def update_account_balance(self):
+        """Update the current cash balance"""
+        account = self.trading_client.get_account()
+        self.cash_balance = min(float(account.cash), float(account.buying_power))
+        return self.cash_balance
+
     async def calculate_fees(self, trade_amount_usd, current_price):
         """Calculate total fees for a trade"""
-        trading_fee = trade_amount_usd * self.trading_fee_pct  # 0.4% trading fee
+        trading_fee = trade_amount_usd * self.trading_fee_pct  # 1.6% trading fee
         network_fee_usd = self.network_fee_xrp * current_price  # XRP network fee
         total_fees = trading_fee + network_fee_usd
         return total_fees
@@ -397,9 +365,85 @@ class XRPStreamer:
             logging.warning(f"Error getting position: {e}")
             return None
 
-    async def check_trading_conditions(self, current_price):
-        """Enhanced trading conditions check"""
+    def get_historical_prices(self, lookback=100):
+        """Retrieve price history for ATR calculation"""
         try:
+            with self.engine.connect() as conn:
+                result = conn.execute(
+                    self.price_history.select()
+                    .order_by(self.price_history.c.timestamp.desc())
+                    .limit(lookback)
+                ).fetchall()
+
+                if not result:
+                    logging.warning("No historical prices found for ATR calculation")
+                    return []
+
+                # Convert to list of prices
+                prices = [float(row.price) for row in result]
+                return prices
+        except Exception as e:
+            logging.error(f"Error getting historical prices: {e}")
+            return []
+
+    async def calculate_dynamic_thresholds(self):
+        """Calculate volatility-based thresholds using ATR"""
+        prices = self.get_historical_prices()
+
+        # Use default values if not enough price history
+        if len(prices) < self.atr_period:
+            logging.info(f"Not enough price history for ATR. Using default thresholds.")
+            return {
+                "entry_offset": 0.015,  # Default 1.5% entry offset
+                "take_profit": 0.035,  # Default 3.5% take profit
+                "stop_loss": 0.015,  # Default 1.5% stop loss
+            }
+
+        # Calculate ATR using pandas_ta
+        df = pd.DataFrame(prices, columns=["close"])
+        # Need high/low/close for ATR, but we only have close prices
+        # Use close price for all to approximate
+        df["high"] = df["close"]
+        df["low"] = df["close"]
+        df["open"] = df["close"]
+
+        # Calculate ATR
+        df.ta.atr(length=self.atr_period, append=True)
+        current_atr = df["ATRr_14"].iloc[-1]
+
+        if pd.isna(current_atr) or current_atr == 0:
+            logging.warning("ATR calculation returned invalid value, using defaults")
+            return {"entry_offset": 0.015, "take_profit": 0.035, "stop_loss": 0.015}
+
+        # Calculate percentage ATR (relative to current price)
+        current_price = prices[0] if prices else 1.0
+        atr_pct = current_atr / current_price
+
+        # Set thresholds based on ATR
+        entry_offset_pct = atr_pct * self.risk_multiplier
+        take_profit_pct = atr_pct * self.take_profit_multiplier
+        stop_loss_pct = atr_pct * self.stop_loss_multiplier
+
+        # Update the instance variables for later reference
+        self.take_profit_threshold = take_profit_pct
+        self.stop_loss_threshold = stop_loss_pct
+
+        logging.info(
+            f"Dynamic thresholds calculated: Entry offset: {entry_offset_pct:.4f}, Take profit: {take_profit_pct:.4f}, Stop loss: {stop_loss_pct:.4f}"
+        )
+
+        return {
+            "entry_offset": entry_offset_pct,
+            "take_profit": take_profit_pct,
+            "stop_loss": stop_loss_pct,
+        }
+
+    async def check_trading_conditions(self, current_price):
+        """Enhanced trading conditions check with dynamic thresholds"""
+        try:
+            # Update thresholds using ATR
+            thresholds = await self.calculate_dynamic_thresholds()
+
             position = await self.get_position()
             orders = self.trading_client.get_orders()
 
@@ -410,7 +454,7 @@ class XRPStreamer:
                 )
 
                 if not has_buy_order and self.cash_balance >= self.position_value:
-                    # Place new buy order
+                    # Place new buy order with dynamic entry
                     buy_order = await self.place_buy_order(current_price)
                     if buy_order:
                         self.active_orders["buy"] = buy_order.id
@@ -425,7 +469,7 @@ class XRPStreamer:
                 has_sl_order = any(
                     o.symbol == "XRP/USD"
                     and o.side == "sell"
-                    and o.type == "stop_limit"
+                    and (o.type == "stop_limit" or o.type == "trailing_stop")
                     for o in orders
                 )
 
@@ -439,19 +483,44 @@ class XRPStreamer:
             return False
 
     async def place_buy_order(self, current_price):
-        """Place a stop-limit buy order for XRP"""
+        """Place a stop-limit buy order for XRP using dynamic thresholds"""
         try:
             # Get account details
             account = self.trading_client.get_account()
             available_balance = float(account.cash)
             buying_power = float(account.buying_power)
+            equity = float(account.equity)
 
             # Use the smaller of cash balance and buying power
             actual_available = min(available_balance, buying_power)
-            max_affordable = (
-                actual_available * 0.95
-            )  # Use 95% of available balance to account for fees
-            position_value = min(self.position_value, max_affordable)
+
+            # Calculate dynamic thresholds based on ATR
+            thresholds = await self.calculate_dynamic_thresholds()
+            entry_offset = thresholds["entry_offset"]
+
+            # Dynamic target entry based on ATR
+            target_entry = round(current_price * (1 - entry_offset), 4)
+            stop_price = round(target_entry * 1.002, 4)
+            limit_price = round(target_entry * 1.005, 4)
+
+            # Risk-based position sizing (risk % of equity)
+            risk_amount = equity * self.risk_percentage
+            max_affordable = actual_available * 0.95  # Use 95% of available balance
+
+            # Calculate position size based on risk and stop loss
+            stop_loss_amount = target_entry * thresholds["stop_loss"]
+            if stop_loss_amount > 0:
+                position_value = min(
+                    risk_amount / thresholds["stop_loss"], max_affordable
+                )
+            else:
+                # Fallback if stop loss calculation fails
+                position_value = min(self.position_value, max_affordable)
+
+            # Ensure minimum and maximum position size
+            position_value = max(
+                min(position_value, self.max_position_size), self.min_position_value
+            )
 
             if position_value < self.min_position_value:
                 logging.warning(
@@ -463,15 +532,10 @@ class XRPStreamer:
                 )
                 return None
 
-            # Calculate order details
-            target_entry = round(
-                current_price * 0.975, 4
-            )  # Target 2.5% below current price
-            stop_price = round(target_entry * 1.002, 4)
-            limit_price = round(target_entry * 1.005, 4)
+            # Calculate quantity
             quantity = round(position_value / target_entry, 1)
 
-            # Place stop-limit buy order
+            # Place stop-limit buy order with expiry
             buy_order = self.trading_client.submit_order(
                 StopLimitOrderRequest(
                     symbol="XRP/USD",
@@ -480,15 +544,17 @@ class XRPStreamer:
                     time_in_force=TimeInForce.GTC,
                     stop_price=str(stop_price),
                     limit_price=str(limit_price),
+                    expire_at=datetime.now() + self.order_expiry,
                 )
             )
 
             logging.info(
                 f"\nPlaced new buy order:\n"
-                f"Entry Price: ${target_entry:.4f} (-2.5%)\n"
+                f"Entry Price: ${target_entry:.4f} (-{entry_offset*100:.2f}%)\n"
                 f"Quantity: {quantity} XRP\n"
                 f"Position Value: ${position_value:.2f}\n"
-                f"Available Balance: ${actual_available:.2f}"
+                f"Available Balance: ${actual_available:.2f}\n"
+                f"Risk Amount: ${risk_amount:.2f}"
             )
 
             return buy_order
@@ -497,89 +563,205 @@ class XRPStreamer:
             logging.error(f"Error placing buy order: {e}")
             return None
 
-    async def place_sell_order(self, current_price, reason):
-        """Place a limit sell order for XRP"""
+    async def place_exit_orders(self, filled_price, filled_qty, order_id):
+        """Place take profit and trailing stop orders after a buy order is filled"""
         try:
-            # Get current position
-            positions = self.trading_client.get_all_positions()
-            position = None
-            for pos in positions:
-                if pos.symbol == "XRP/USD":
-                    position = pos
+            # Get current position to verify available quantity
+            max_retries = 3
+            retry_delay = 1  # seconds
+            available_qty = 0
+            position_found = False
+
+            for retry in range(max_retries):
+                positions = self.trading_client.get_all_positions()
+                position = None
+                for pos in positions:
+                    if pos.symbol == "XRP/USD":
+                        position = pos
+                        break
+
+                if position and float(position.qty) > 0:
+                    available_qty = float(position.qty)
+                    position_found = True
+                    logging.info(
+                        f"Current position found on attempt {retry+1}: {available_qty} XRP available for exit orders"
+                    )
                     break
+                else:
+                    if retry < max_retries - 1:
+                        logging.info(
+                            f"Position not found or zero quantity on attempt {retry+1}, retrying in {retry_delay} seconds..."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
 
-            if not position:
-                logging.warning("No XRP position found to sell")
-                return
+            if position_found:
+                # Calculate dynamic thresholds
+                thresholds = await self.calculate_dynamic_thresholds()
+                take_profit_threshold = thresholds["take_profit"]
+                stop_loss_threshold = thresholds["stop_loss"]
 
-            # Get available quantity
-            available_qty = float(position.qty_available)
-            if available_qty <= 0:
-                logging.warning(
-                    f"No available XRP to place orders (total: {position.qty}, available: {available_qty})"
-                )
-                return
+                # Place take profit order
+                take_profit_price = round(filled_price * (1 + take_profit_threshold), 4)
+                try:
+                    tp_order = self.trading_client.submit_order(
+                        LimitOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            limit_price=str(take_profit_price),
+                        )
+                    )
+                    self.active_orders["take_profit"] = tp_order.id
+                    self.store_order(tp_order)
+                    logging.info(
+                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
+                    )
+                except Exception as e:
+                    logging.error(f"Error placing take profit order: {e}")
 
-            sell_value = available_qty * current_price
-            entry_price = float(position.avg_entry_price)
-
-            # Calculate fees for the sell
-            fees = await self.calculate_fees(sell_value, current_price)
-
-            # Calculate limit price based on reason
-            if reason == "take_profit":
-                limit_price = entry_price * (1 + self.take_profit_threshold)
-            elif reason == "stop_loss":
-                limit_price = (
-                    current_price * 0.995
-                )  # Slightly below current price for quick execution
+                # Place trailing stop order instead of fixed stop loss
+                trail_percent = round(
+                    stop_loss_threshold * 100, 2
+                )  # Convert to percentage
+                try:
+                    sl_order = self.trading_client.submit_order(
+                        TrailingStopOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            trail_percent=str(trail_percent),
+                        )
+                    )
+                    self.active_orders["stop_loss"] = sl_order.id
+                    self.store_order(sl_order)
+                    logging.info(
+                        f"Trailing stop order placed: {available_qty} XRP with {trail_percent}% trail"
+                    )
+                except Exception as e:
+                    logging.error(f"Error placing trailing stop order: {e}")
+                    # Fallback to regular stop loss if trailing stop fails
+                    self._place_fallback_stop_loss(
+                        filled_price, available_qty, stop_loss_threshold
+                    )
             else:
-                limit_price = (
-                    current_price * 0.998
-                )  # Regular sell slightly below current price
-
-            # Round limit price to 4 decimal places
-            limit_price = round(limit_price, 4)
-
-            # Create limit order request
-            order_data = LimitOrderRequest(
-                symbol="XRP/USD",
-                qty=str(available_qty),
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=str(limit_price),
-            )
-
-            # Place the order
-            order = self.trading_client.submit_order(order_data)
-            self.last_order_time = datetime.now()
-
-            # Update total fees
-            self.total_fees_paid += fees
-
-            # Store order details with fees
-            self.store_order(order, fees)
-
-            logging.info(
-                f"\nLimit sell order placed: {available_qty} XRP ({reason})\n"
-                f"Current Price: ${current_price:.4f}\n"
-                f"Limit Price: ${limit_price:.4f}\n"
-                f"Order Value: ${sell_value:.2f}\n"
-                f"Fees: ${fees:.2f}\n"
-                f"Total Fees Paid: ${self.total_fees_paid:.2f}\n"
-                f"\nPreparing for next trade:\n"
-                f"Will attempt to buy when price drops -2.5% below ${current_price:.4f}\n"
-                f"Target entry around: ${current_price * 0.975:.4f}"
-            )
-
-            # Update position information
-            await self.update_position()
-
-            return order
+                # Fallback logic for when position is not found
+                logging.warning("Using fallback logic for exit orders...")
+                # ...existing code for fallback...
 
         except Exception as e:
-            logging.error(f"Error placing sell order: {e}")
-            return None
+            logging.error(f"Error placing exit orders: {e}")
+
+    def _place_fallback_stop_loss(
+        self, filled_price, available_qty, stop_loss_threshold
+    ):
+        """Fallback method to place a regular stop loss if trailing stop fails"""
+        try:
+            stop_loss_price = round(filled_price * (1 - stop_loss_threshold), 4)
+            limit_price = round(stop_loss_price * 0.995, 4)
+
+            sl_order = self.trading_client.submit_order(
+                StopLimitOrderRequest(
+                    symbol="XRP/USD",
+                    qty=str(available_qty),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=str(stop_loss_price),
+                    limit_price=str(limit_price),
+                )
+            )
+            self.active_orders["stop_loss"] = sl_order.id
+            self.store_order(sl_order)
+            logging.info(
+                f"Fallback stop loss order placed: {available_qty} XRP @ ${stop_loss_price:.4f} (-{stop_loss_threshold*100:.2f}%)"
+            )
+        except Exception as e:
+            logging.error(f"Error placing fallback stop loss: {e}")
+
+    async def ensure_exit_orders(self, position, current_price):
+        """Ensure take profit and trailing stop orders exist for an open position"""
+        if not position:
+            return
+
+        try:
+            entry_price = float(position.avg_entry_price)
+            available_qty = float(position.qty_available)
+
+            if available_qty <= 0:
+                return
+
+            # Get all orders
+            orders = self.trading_client.get_orders()
+
+            # Check if we already have the necessary orders
+            has_tp_order = any(
+                o.symbol == "XRP/USD" and o.side == "sell" and o.type == "limit"
+                for o in orders
+            )
+            has_sl_order = any(
+                o.symbol == "XRP/USD"
+                and o.side == "sell"
+                and (o.type == "stop_limit" or o.type == "trailing_stop")
+                for o in orders
+            )
+
+            # Calculate dynamic thresholds
+            thresholds = await self.calculate_dynamic_thresholds()
+            take_profit_threshold = thresholds["take_profit"]
+            stop_loss_threshold = thresholds["stop_loss"]
+
+            # Place take profit order if needed
+            if not has_tp_order:
+                take_profit_price = round(entry_price * (1 + take_profit_threshold), 4)
+                try:
+                    tp_order = self.trading_client.submit_order(
+                        LimitOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            limit_price=str(take_profit_price),
+                        )
+                    )
+                    self.active_orders["take_profit"] = tp_order.id
+                    self.store_order(tp_order)
+                    logging.info(
+                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
+                    )
+                except Exception as e:
+                    logging.error(f"Error placing take profit order: {e}")
+
+            # Place trailing stop order if needed
+            if not has_sl_order:
+                trail_percent = round(
+                    stop_loss_threshold * 100, 2
+                )  # Convert to percentage
+                try:
+                    sl_order = self.trading_client.submit_order(
+                        TrailingStopOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            trail_percent=str(trail_percent),
+                        )
+                    )
+                    self.active_orders["stop_loss"] = sl_order.id
+                    self.store_order(sl_order)
+                    logging.info(
+                        f"Trailing stop order placed: {available_qty} XRP with {trail_percent}% trail"
+                    )
+                except Exception as e:
+                    logging.error(f"Error placing trailing stop order: {e}")
+                    # Fallback to regular stop loss
+                    self._place_fallback_stop_loss(
+                        entry_price, available_qty, stop_loss_threshold
+                    )
+
+        except Exception as e:
+            logging.error(f"Error ensuring exit orders: {e}")
 
     async def initialize_orders(self):
         """Initialize orders on startup without canceling positions"""
@@ -647,204 +829,50 @@ class XRPStreamer:
                 if not has_buy_order and self.cash_balance >= self.min_position_value:
                     await self.place_buy_order(current_price)
 
-            # Log current status - Pass the position and orders to _log_trading_status
+            # Log current status
             self._log_trading_status(position, orders)
 
         except Exception as e:
             logging.error(f"Error initializing orders: {e}")
 
     async def process_message(self, message):
-        """Enhanced message processing to handle all data types"""
+        """Enhanced message processing with frequent position checks"""
         try:
             data = json.loads(message)
             if not isinstance(data, list):
-                logging.debug("Received non-list message, skipping")
                 return
 
             for msg in data:
                 msg_type = msg.get("T")
 
-                if msg_type == "q":  # Quote message
-                    bid_price = float(msg.get("bp", 0))
-                    ask_price = float(msg.get("ap", 0))
-                    if bid_price > 0 and ask_price > 0:
-                        current_price = (
-                            bid_price + ask_price
-                        ) / 2  # Calculate mid-price
-                        timestamp_str = msg.get("t")
+                if msg_type in ["q", "t"]:
+                    current_price = None
 
-                        # Handle different timestamp formats
-                        if isinstance(timestamp_str, str):
-                            timestamp = datetime.fromisoformat(
-                                timestamp_str.replace("Z", "+00:00")
-                            )
-                        else:
-                            # Assuming it's a millisecond timestamp
-                            timestamp = datetime.fromtimestamp(timestamp_str / 1000)
+                    if msg_type == "q":
+                        bid_price = float(msg.get("bp", 0))
+                        ask_price = float(msg.get("ap", 0))
+                        if bid_price > 0 and ask_price > 0:
+                            current_price = (bid_price + ask_price) / 2
+                    else:  # Trade
+                        current_price = float(msg.get("p", 0))
 
-                        success = self.store_price(current_price, timestamp)
-
-                        # Log less frequently - only once per 30 seconds
+                    if current_price:
+                        self.store_price(current_price)
+                        # Check position and orders every 5 seconds
                         current_time = datetime.now()
                         if (
-                            current_time.second % self.price_log_interval == 0
-                        ) and success:
-                            logging.info(f"Stored quote price: {current_price:.4f}")
-
-                        # Only trigger position check on significant price changes
-                        if (
-                            self._last_logged_price is None
-                            or abs(current_price - self._last_logged_price) > 0.01
+                            not self.last_check_time
+                            or (current_time - self.last_check_time).total_seconds()
+                            >= 5
                         ):
-                            await self.update_position()
-                            self._last_logged_price = current_price
-
-                elif msg_type == "t":  # Trade message
-                    # Handle trade message
-                    price = float(msg.get("p", 0))
-                    timestamp_str = msg.get("t")
-
-                    if price > 0:
-                        # Handle different timestamp formats
-                        if isinstance(timestamp_str, str):
-                            timestamp = datetime.fromisoformat(
-                                timestamp_str.replace("Z", "+00:00")
-                            )
-                        else:
-                            # Assuming it's a millisecond timestamp
-                            timestamp = datetime.fromtimestamp(timestamp_str / 1000)
-
-                        success = self.store_price(price, timestamp)
-
-                        # Reduce logging frequency for trades
-                        current_time = datetime.now()
-                        if (
-                            current_time.second % self.price_log_interval == 0
-                        ) and success:
-                            logging.info(f"Stored trade price: {price:.4f}")
-
-                        # Trigger position check
-                        await self.update_position()
-                elif (
-                    msg_type == "b"
-                ):  # Bar message - enhanced to use for technical analysis
-                    # Enhanced bar data handling
-                    symbol = msg.get("S")
-                    open_price = float(msg.get("o", 0))
-                    high_price = float(msg.get("h", 0))
-                    low_price = float(msg.get("l", 0))
-                    close_price = float(msg.get("c", 0))
-                    volume = float(msg.get("v", 0))
-                    timestamp_str = msg.get("t")
-
-                    # Only process if we have valid data
-                    if close_price > 0 and symbol == self.symbol:
-                        # Handle different timestamp formats
-                        if isinstance(timestamp_str, str):
-                            timestamp = datetime.fromisoformat(
-                                timestamp_str.replace("Z", "+00:00")
-                            )
-                        else:
-                            timestamp = datetime.fromtimestamp(timestamp_str / 1000)
-
-                        # Only log bar data at the beginning of each minute to reduce noise
-                        if timestamp.second == 0:
-                            logging.info(
-                                f"Bar [{timestamp.strftime('%H:%M')}]: O:{open_price:.4f} H:{high_price:.4f} "
-                                f"L:{low_price:.4f} C:{close_price:.4f} V:{volume:.1f}"
-                            )
-
-                            # Calculate some basic technical indicators
-                            await self.analyze_bar_data(
-                                open_price,
-                                high_price,
-                                low_price,
-                                close_price,
-                                volume,
-                                timestamp,
-                            )
-
-                        # Store closing price with low priority - don't duplicate quotes/trades data
-                        stored_price = self.get_last_price()
-                        if (
-                            stored_price is None
-                            or abs(stored_price - close_price) > 0.001
-                        ):
-                            success = self.store_price(close_price, timestamp)
-
-                            # Reduce noise - only log once per minute
-                            if success and timestamp.second == 0:
-                                logging.info(
-                                    f"Stored bar close price: {close_price:.4f}"
-                                )
-
-                                # Only update position on new minute bars
-                                await self.update_position()
+                            await self.update_position()  # This will now handle everything
+                            self.last_check_time = current_time
 
         except Exception as e:
-            logging.error(f"Error processing message: {e}", exc_info=True)
-
-    # Add a new method for basic technical analysis using bar data
-    async def analyze_bar_data(
-        self, open_price, high_price, low_price, close_price, volume, timestamp
-    ):
-        """Perform basic technical analysis on bar data"""
-        try:
-            # Get recent prices to calculate moving averages
-            with self.engine.connect() as conn:
-                # Get last 20 prices for simple moving average calculation
-                recent_prices = conn.execute(
-                    self.price_history.select()
-                    .order_by(self.price_history.c.timestamp.desc())
-                    .limit(20)
-                ).fetchall()
-
-                if len(recent_prices) >= 5:  # Minimum 5 bars needed for analysis
-                    # Calculate 5-period SMA
-                    sma5 = sum(row.price for row in recent_prices[:5]) / 5
-
-                    # Calculate 20-period SMA if enough data
-                    sma20 = None
-                    if len(recent_prices) >= 20:
-                        sma20 = sum(row.price for row in recent_prices[:20]) / 20
-
-                    # Basic trend analysis
-                    if sma5 and sma20:
-                        if sma5 > sma20:
-                            trend = "BULLISH"
-                        elif sma5 < sma20:
-                            trend = "BEARISH"
-                        else:
-                            trend = "NEUTRAL"
-
-                        # Log technical analysis only once per minute
-                        logging.info(
-                            f"Technical Analysis [{timestamp.strftime('%H:%M')}]: "
-                            f"SMA5: ${sma5:.4f}, SMA20: ${sma20:.4f}, Trend: {trend}"
-                        )
-
-                        # Use trend information to adjust trading parameters
-                        if trend == "BULLISH" and self.take_profit_threshold < 0.04:
-                            # In bullish trend, slightly increase take profit target
-                            self.take_profit_threshold = (
-                                0.04  # 4% take profit in bullish trend
-                            )
-                            logging.info(
-                                f"Adjusted take profit threshold to {self.take_profit_threshold:.1%} due to bullish trend"
-                            )
-                        elif trend == "BEARISH" and self.take_profit_threshold > 0.03:
-                            # In bearish trend, lower take profit target to exit faster
-                            self.take_profit_threshold = (
-                                0.03  # 3% take profit in bearish trend
-                            )
-                            logging.info(
-                                f"Adjusted take profit threshold to {self.take_profit_threshold:.1%} due to bearish trend"
-                            )
-        except Exception as e:
-            logging.error(f"Error analyzing bar data: {e}")
+            logging.error(f"Error processing message: {e}")
 
     async def connect(self):
-        """Connect to the WebSocket and authenticate with enhanced subscription"""
+        """Connect to the WebSocket and authenticate"""
         try:
             # Close existing connection if any
             if self.ws:
@@ -873,14 +901,13 @@ class XRPStreamer:
                 # View price history before starting
                 self.view_price_history()
 
-                # Subscribe to trades, quotes, and minute bars - ensure quotes are included
+                # Subscribe to trades, quotes, and minute bars
                 subscribe_data = {
                     "action": "subscribe",
                     "trades": [self.symbol],
                     "quotes": [self.symbol],
                     "bars": [self.symbol],
                 }
-
                 await self.ws.send(json.dumps(subscribe_data))
                 response = await self.ws.recv()
                 logging.info(f"Subscription response: {response}")
@@ -896,7 +923,7 @@ class XRPStreamer:
             return False
 
     async def stream(self):
-        """Main streaming loop with improved message handling"""
+        """Main streaming loop"""
         try:
             # Connect to WebSocket
             await self.connect()
@@ -914,22 +941,10 @@ class XRPStreamer:
             while self.ws and self.connected:
                 try:
                     message = await asyncio.wait_for(self.ws.recv(), timeout=30)
+                    data = json.loads(message)
 
-                    # Process raw message first
-                    await self.process_message(message)
-
-                    # Then try more specific handlers if needed
-                    try:
-                        data = json.loads(message)
-
-                        if isinstance(data, list):
-                            for msg in data:
-                                if "T" in msg and msg["T"] == "trade":
-                                    await self.handle_trade(msg)
-                        elif "T" in data and data["T"] == "trade":
-                            await self.handle_trade(data)
-                    except Exception as e:
-                        logging.error(f"Error processing JSON in stream: {e}")
+                    if "T" in data and data["T"] == "trade":
+                        await self.handle_trade(data)
 
                 except asyncio.TimeoutError:
                     # Send ping to keep connection alive
@@ -967,9 +982,6 @@ class XRPStreamer:
         last_buy_attempt_time = datetime.now() - timedelta(
             minutes=10
         )  # Initialize with past time
-        last_log_time = datetime.now() - timedelta(
-            minutes=5
-        )  # Initialize last log time
 
         while True:
             try:
@@ -978,14 +990,53 @@ class XRPStreamer:
                 orders = self.trading_client.get_orders()
                 current_price = self.get_last_price()
 
-                # Only log detailed position status every 60 seconds to reduce noise
-                current_time = datetime.now()
-                if (
-                    current_time - last_log_time
-                ).total_seconds() >= 60:  # Log every 60 seconds instead of every 5 seconds
-                    # Use the previously unused method to log detailed status
-                    self._log_trading_status(position, orders)
-                    last_log_time = current_time
+                # Log all positions and orders status
+                logging.info("\n=== Detailed Position & Order Status ===")
+
+                # Position information
+                if position:
+                    logging.info(f"\nCurrent Position:")
+                    logging.info(f"Quantity: {float(position.qty):.2f} XRP")
+                    logging.info(f"Entry Price: ${float(position.avg_entry_price):.4f}")
+                    logging.info(f"Current Value: ${float(position.market_value):.2f}")
+                    logging.info(
+                        f"Unrealized P/L: ${float(position.unrealized_pl):.2f} ({float(position.unrealized_plpc):.2%})"
+                    )
+                else:
+                    logging.info("\nNo Active Position")
+
+                # Order information
+                logging.info("\nActive Orders:")
+                if orders:
+                    for order in orders:
+                        order_type = "Buy" if order.side == "buy" else "Sell"
+                        order_status = order.status
+                        order_price = (
+                            float(order.limit_price)
+                            if order.limit_price
+                            else float(order.stop_price)
+                        )
+                        order_qty = float(order.qty)
+                        filled_qty = float(order.filled_qty) if order.filled_qty else 0
+
+                        logging.info(
+                            f"{order_type} Order:\n"
+                            f"  Status: {order_status}\n"
+                            f"  Price: ${order_price:.4f}\n"
+                            f"  Quantity: {order_qty} XRP\n"
+                            f"  Filled: {filled_qty} XRP"
+                        )
+                else:
+                    logging.info("No Active Orders")
+
+                # Account information
+                account = self.trading_client.get_account()
+                buying_power = float(account.buying_power)
+                cash = float(account.cash)
+                logging.info(f"\nAccount Status:")
+                logging.info(f"Cash Balance: ${cash:.2f}")
+                logging.info(f"Buying Power: ${buying_power:.2f}")
+                logging.info("=" * 40 + "\n")
 
                 # Continue with normal position checking
                 if position:
@@ -997,7 +1048,6 @@ class XRPStreamer:
                         o.symbol == "XRP/USD"
                         and o.side == "sell"
                         and o.type == "stop_limit"
-                        for o in orders
                     )
 
                     if not (has_tp_order and has_sl_order):
@@ -1102,18 +1152,18 @@ class XRPStreamer:
     async def monitor_buy_orders(self):
         """Continuously monitor buy orders until they're filled, then place sell orders"""
         logging.info("Starting buy order monitoring...")
-        last_order_log_time = datetime.now() - timedelta(minutes=5)
 
         while True:
             try:
                 # Get all orders
                 orders = self.trading_client.get_orders()
+                logging.info(f"Retrieved {len(orders)} total orders")
 
-                # Only log summary every minute to reduce noise
-                current_time = datetime.now()
-                if (current_time - last_order_log_time).total_seconds() >= 60:
-                    logging.info(f"Monitoring {len(orders)} total orders")
-                    last_order_log_time = current_time
+                # Debug log all orders
+                for order in orders:
+                    logging.info(
+                        f"Order: {order.id}, Symbol: {order.symbol}, Side: {order.side}, Status: {order.status}"
+                    )
 
                 # Check for active buy orders
                 buy_orders = [
@@ -1121,29 +1171,18 @@ class XRPStreamer:
                     for o in orders
                     if o.symbol == "XRP/USD" and o.side == OrderSide.BUY
                 ]
+                logging.info(f"Filtered to {len(buy_orders)} buy orders for XRP/USD")
 
                 if buy_orders:
-                    # Only log the number of orders, not each individual one
-                    if (
-                        current_time - last_order_log_time
-                    ).total_seconds() < 5:  # Avoid double logging
-                        logging.info(f"Monitoring {len(buy_orders)} active buy orders")
-
+                    logging.info(f"Monitoring {len(buy_orders)} active buy orders")
                     for buy_order in buy_orders:
                         order_id = buy_order.id
                         status = buy_order.status
 
-                        # Only log status changes or significant events
-                        if (
-                            order_id not in self.last_order_status
-                            or self.last_order_status[order_id] != status
-                        ):
-                            logging.info(
-                                f"Buy order {order_id} status changed to: {status}"
-                            )
-                            self.last_order_status[order_id] = status
+                        logging.info(
+                            f"Monitoring buy order {order_id}: Status = {status}"
+                        )
 
-                        # Process order status
                         # If order is filled, place sell orders
                         if status == OrderStatus.FILLED:
                             filled_price = float(buy_order.filled_avg_price)
@@ -1202,10 +1241,9 @@ class XRPStreamer:
                 await asyncio.sleep(5)
 
     async def place_exit_orders(self, filled_price, filled_qty, order_id):
-        """Place take profit and stop loss orders after a buy order is filled with better asset verification"""
-        # Get current position to verify available quantity
+        """Place take profit and trailing stop orders after a buy order is filled"""
         try:
-            # Add retry mechanism to handle timing issues
+            # Get current position to verify available quantity
             max_retries = 3
             retry_delay = 1  # seconds
             available_qty = 0
@@ -1235,10 +1273,13 @@ class XRPStreamer:
                         retry_delay *= 2  # Exponential backoff
 
             if position_found:
+                # Calculate dynamic thresholds
+                thresholds = await self.calculate_dynamic_thresholds()
+                take_profit_threshold = thresholds["take_profit"]
+                stop_loss_threshold = thresholds["stop_loss"]
+
                 # Place take profit order
-                take_profit_price = round(
-                    filled_price * (1 + self.take_profit_threshold), 4
-                )
+                take_profit_price = round(filled_price * (1 + take_profit_threshold), 4)
                 try:
                     tp_order = self.trading_client.submit_order(
                         LimitOrderRequest(
@@ -1252,187 +1293,138 @@ class XRPStreamer:
                     self.active_orders["take_profit"] = tp_order.id
                     self.store_order(tp_order)
                     logging.info(
-                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f}"
+                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
                     )
                 except Exception as e:
                     logging.error(f"Error placing take profit order: {e}")
 
-                # Place stop loss order
-                stop_loss_price = round(
-                    filled_price * (1 - self.stop_loss_threshold), 4
-                )
-                limit_price = round(stop_loss_price * 0.995, 4)
+                # Place trailing stop order instead of fixed stop loss
+                trail_percent = round(
+                    stop_loss_threshold * 100, 2
+                )  # Convert to percentage
                 try:
                     sl_order = self.trading_client.submit_order(
-                        StopLimitOrderRequest(
+                        TrailingStopOrderRequest(
                             symbol="XRP/USD",
                             qty=str(available_qty),
                             side=OrderSide.SELL,
                             time_in_force=TimeInForce.GTC,
-                            stop_price=str(stop_loss_price),
-                            limit_price=str(limit_price),
+                            trail_percent=str(trail_percent),
                         )
                     )
                     self.active_orders["stop_loss"] = sl_order.id
                     self.store_order(sl_order)
                     logging.info(
-                        f"Stop loss order placed: {available_qty} XRP @ ${stop_loss_price:.4f}"
+                        f"Trailing stop order placed: {available_qty} XRP with {trail_percent}% trail"
                     )
                 except Exception as e:
-                    logging.error(f"Error placing stop loss order: {e}")
+                    logging.error(f"Error placing trailing stop order: {e}")
+                    # Fallback to regular stop loss if trailing stop fails
+                    self._place_fallback_stop_loss(
+                        filled_price, available_qty, stop_loss_threshold
+                    )
             else:
-                # If position still not found after retries, improve the fallback mechanism
+                # If position still not found after retries, try using the filled quantity as fallback
                 logging.warning(
-                    "Position not found after retries. Checking account assets directly..."
+                    "Position not found after retries. Attempting to place exit orders using filled quantity as fallback."
                 )
-
                 try:
-                    # Get account assets directly
+                    # Double-check if we have any XRP balance
                     account = self.trading_client.get_account()
+                    for balance in account.non_marginable_buying_power:
+                        if balance.asset_id == "XRP":
+                            available_qty = float(balance.available)
+                            logging.info(
+                                f"Found XRP balance from account: {available_qty}"
+                            )
+                            break
 
-                    # Check if we actually have any XRP holdings
-                    has_xrp = False
-                    available_qty = 0
-
-                    # Try multiple methods to find XRP balance
-                    try:
-                        # First method: Check non-marginable buying power
-                        for balance in account.non_marginable_buying_power:
-                            if balance.asset_id == "XRP":
-                                available_qty = float(balance.available)
-                                has_xrp = True
-                                logging.info(
-                                    f"Found XRP balance in non-marginable assets: {available_qty}"
-                                )
-                                break
-                    except (AttributeError, TypeError):
-                        logging.info(
-                            "Could not check non-marginable assets, trying positions API..."
-                        )
-
-                    # Second method: Try positions API again with different parameters
-                    if not has_xrp:
-                        try:
-                            positions = self.trading_client.get_all_positions()
-                            for pos in positions:
-                                if pos.symbol == "XRP" or pos.symbol == "XRP/USD":
-                                    available_qty = float(pos.qty)
-                                    has_xrp = True
-                                    logging.info(
-                                        f"Found XRP position via secondary check: {available_qty}"
-                                    )
-                                    break
-                        except Exception as e:
-                            logging.warning(f"Error in secondary position check: {e}")
-
-                    # Only place orders if we've verified XRP holdings
-                    if has_xrp and available_qty > 0:
-                        # Place take profit and stop loss orders
+                    if available_qty > 0:
                         # Place take profit order
                         take_profit_price = round(
                             filled_price * (1 + self.take_profit_threshold), 4
                         )
-                        try:
-                            tp_order = self.trading_client.submit_order(
-                                LimitOrderRequest(
-                                    symbol="XRP/USD",
-                                    qty=str(available_qty),
-                                    side=OrderSide.SELL,
-                                    time_in_force=TimeInForce.GTC,
-                                    limit_price=str(take_profit_price),
-                                )
+                        tp_order = self.trading_client.submit_order(
+                            LimitOrderRequest(
+                                symbol="XRP/USD",
+                                qty=str(available_qty),
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.GTC,
+                                limit_price=str(take_profit_price),
                             )
-                            self.active_orders["take_profit"] = tp_order.id
-                            self.store_order(tp_order)
-                            logging.info(
-                                f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f}"
-                            )
-                        except Exception as e:
-                            logging.error(f"Error placing take profit order: {e}")
+                        )
+                        self.active_orders["take_profit"] = tp_order.id
+                        self.store_order(tp_order)
+                        logging.info(
+                            f"Take profit order placed using account balance: {available_qty} XRP @ ${take_profit_price:.4f}"
+                        )
 
                         # Place stop loss order
                         stop_loss_price = round(
                             filled_price * (1 - self.stop_loss_threshold), 4
                         )
                         limit_price = round(stop_loss_price * 0.995, 4)
-                        try:
-                            sl_order = self.trading_client.submit_order(
-                                StopLimitOrderRequest(
-                                    symbol="XRP/USD",
-                                    qty=str(available_qty),
-                                    side=OrderSide.SELL,
-                                    time_in_force=TimeInForce.GTC,
-                                    stop_price=str(stop_loss_price),
-                                    limit_price=str(limit_price),
-                                )
+                        sl_order = self.trading_client.submit_order(
+                            StopLimitOrderRequest(
+                                symbol="XRP/USD",
+                                qty=str(available_qty),
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.GTC,
+                                stop_price=str(stop_loss_price),
+                                limit_price=str(limit_price),
                             )
-                            self.active_orders["stop_loss"] = sl_order.id
-                            self.store_order(sl_order)
-                            logging.info(
-                                f"Stop loss order placed: {available_qty} XRP @ ${stop_loss_price:.4f}"
-                            )
-                        except Exception as e:
-                            logging.error(f"Error placing stop loss order: {e}")
+                        )
+                        self.active_orders["stop_loss"] = sl_order.id
+                        self.store_order(sl_order)
+                        logging.info(
+                            f"Stop loss order placed using account balance: {available_qty} XRP @ ${stop_loss_price:.4f}"
+                        )
                     else:
-                        logging.error(
-                            "Could not verify XRP holdings. Will not place exit orders."
+                        # Last resort: try using the filled quantity from the order
+                        logging.warning(
+                            "No XRP balance found. Attempting to use filled quantity from order as last resort."
+                        )
+                        available_qty = filled_qty
+
+                        # Place take profit order
+                        take_profit_price = round(
+                            filled_price * (1 + self.take_profit_threshold), 4
+                        )
+                        tp_order = self.trading_client.submit_order(
+                            LimitOrderRequest(
+                                symbol="XRP/USD",
+                                qty=str(available_qty),
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.GTC,
+                                limit_price=str(take_profit_price),
+                            )
+                        )
+                        self.active_orders["take_profit"] = tp_order.id
+                        self.store_order(tp_order)
+                        logging.info(
+                            f"Take profit order placed using filled quantity: {available_qty} XRP @ ${take_profit_price:.4f}"
                         )
 
-                        # As a last resort, check if the original filled quantity is reliable
-                        if filled_qty > 0:
-                            logging.warning(
-                                f"Using filled quantity as last resort: {filled_qty} XRP"
+                        # Place stop loss order
+                        stop_loss_price = round(
+                            filled_price * (1 - self.stop_loss_threshold), 4
+                        )
+                        limit_price = round(stop_loss_price * 0.995, 4)
+                        sl_order = self.trading_client.submit_order(
+                            StopLimitOrderRequest(
+                                symbol="XRP/USD",
+                                qty=str(available_qty),
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.GTC,
+                                stop_price=str(stop_loss_price),
+                                limit_price=str(limit_price),
                             )
-                            # Place limited exit orders with the filled quantity
-                            # Place take profit order
-                            take_profit_price = round(
-                                filled_price * (1 + self.take_profit_threshold), 4
-                            )
-                            try:
-                                tp_order = self.trading_client.submit_order(
-                                    LimitOrderRequest(
-                                        symbol="XRP/USD",
-                                        qty=str(filled_qty),
-                                        side=OrderSide.SELL,
-                                        time_in_force=TimeInForce.GTC,
-                                        limit_price=str(take_profit_price),
-                                    )
-                                )
-                                self.active_orders["take_profit"] = tp_order.id
-                                self.store_order(tp_order)
-                                logging.info(
-                                    f"Take profit order placed: {filled_qty} XRP @ ${take_profit_price:.4f}"
-                                )
-                            except Exception as e:
-                                logging.error(f"Error placing take profit order: {e}")
-
-                            # Place stop loss order
-                            stop_loss_price = round(
-                                filled_price * (1 - self.stop_loss_threshold), 4
-                            )
-                            limit_price = round(stop_loss_price * 0.995, 4)
-                            try:
-                                sl_order = self.trading_client.submit_order(
-                                    StopLimitOrderRequest(
-                                        symbol="XRP/USD",
-                                        qty=str(filled_qty),
-                                        side=OrderSide.SELL,
-                                        time_in_force=TimeInForce.GTC,
-                                        stop_price=str(stop_loss_price),
-                                        limit_price=str(limit_price),
-                                    )
-                                )
-                                self.active_orders["stop_loss"] = sl_order.id
-                                self.store_order(sl_order)
-                                logging.info(
-                                    f"Stop loss order placed: {filled_qty} XRP @ ${stop_loss_price:.4f}"
-                                )
-                            except Exception as e:
-                                logging.error(f"Error placing stop loss order: {e}")
-                        else:
-                            logging.error(
-                                "No reliable quantity data available. Cannot place exit orders."
-                            )
+                        )
+                        self.active_orders["stop_loss"] = sl_order.id
+                        self.store_order(sl_order)
+                        logging.info(
+                            f"Stop loss order placed using filled quantity: {available_qty} XRP @ ${stop_loss_price:.4f}"
+                        )
                 except Exception as e:
                     logging.error(
                         f"Error checking account balance and placing fallback orders: {e}"
@@ -1608,45 +1600,24 @@ class XRPStreamer:
             logging.error(f"Error handling trade data: {e}")
 
     def process_trade_data(self, trade):
-        """Process a single trade data point with improved error handling"""
+        """Process a single trade data point"""
         try:
             # Extract trade information
             symbol = trade.get("S")
             price = float(trade.get("p", 0))
-
-            # For quote data, calculate mid-price
-            if trade.get("T") == "q":
-                bid_price = float(trade.get("bp", 0))
-                ask_price = float(trade.get("ap", 0))
-                if bid_price > 0 and ask_price > 0:
-                    price = (bid_price + ask_price) / 2
-
             timestamp_str = trade.get("t")
 
             if not all([symbol, price, timestamp_str]):
-                logging.debug(
-                    f"Incomplete trade data: Symbol={symbol}, Price={price}, Timestamp={timestamp_str}"
-                )
                 return
 
             # Convert timestamp to datetime
-            try:
-                if isinstance(timestamp_str, str):
-                    timestamp = datetime.fromisoformat(
-                        timestamp_str.replace("Z", "+00:00")
-                    )
-                else:
-                    # Assuming it's a millisecond timestamp
-                    timestamp = datetime.fromtimestamp(timestamp_str / 1000)
-            except Exception as e:
-                logging.error(f"Error parsing timestamp {timestamp_str}: {e}")
-                timestamp = datetime.now()
+            timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
 
             # Store price in memory
             self.last_price = price
 
             # Store price in database
-            success = self.store_price(price, timestamp)
+            self.store_price(symbol, price, timestamp)
 
             # Log trade (only occasionally to avoid too much output)
             if timestamp.second % 10 == 0:  # Log only every 10 seconds
@@ -1658,21 +1629,20 @@ class XRPStreamer:
             logging.error(f"Error processing trade data: {e}")
 
     def view_price_history(self):
-        """View limited recent price history to avoid excessive logging"""
+        """View all stored reference prices"""
         try:
             with self.engine.connect() as conn:
-                # Limit to last 10 entries to avoid excessive logging
                 result = conn.execute(
-                    self.price_history.select()
-                    .order_by(self.price_history.c.timestamp.desc())
-                    .limit(10)  # Only show last 10 entries
+                    self.price_history.select().order_by(
+                        self.price_history.c.timestamp.desc()
+                    )
                 ).fetchall()
 
                 if not result:
                     logging.info("No price history found")
                     return
 
-                logging.info("\nRecent Price History (Last 10 entries):")
+                logging.info("\nPrice History:")
                 logging.info("Timestamp | Symbol | Price")
                 logging.info("-" * 50)
 
@@ -1771,67 +1741,46 @@ class XRPStreamer:
             logging.error(f"Error displaying trading plan: {e}")
 
     async def display_order_trading_plan(self, buy_order):
-        """Display the trading plan for a specific buy order with reduced redundancy"""
+        """Display the trading plan for a specific buy order"""
         try:
             order_id = buy_order.id
-            order_status = buy_order.status
+            order_price = (
+                float(buy_order.limit_price)
+                if buy_order.limit_price
+                else float(buy_order.filled_avg_price)
+            )
+            order_qty = float(buy_order.qty)
+            filled_qty = float(buy_order.filled_qty) if buy_order.filled_qty else 0
+            remaining_qty = order_qty - filled_qty
 
-            # Only display the trading plan if the order status changed or it's been a while
-            current_time = datetime.now()
-            time_since_last_log = (
-                current_time - self.last_trading_plan_log
-            ).total_seconds()
+            # Calculate the planned exit prices
+            take_profit_price = round(order_price * (1 + self.take_profit_threshold), 4)
+            stop_loss_price = round(order_price * (1 - self.stop_loss_threshold), 4)
 
-            if (
-                order_id not in self.last_order_status
-                or self.last_order_status[order_id] != order_status
-                or time_since_last_log >= 300
-            ):  # Log at most every 5 minutes
+            # Calculate potential profit/loss
+            potential_profit = (take_profit_price - order_price) * order_qty
+            potential_loss = (order_price - stop_loss_price) * order_qty
 
-                # Update tracking
-                self.last_order_status[order_id] = order_status
-                self.last_trading_plan_log = current_time
+            # Calculate risk-reward ratio
+            risk_reward_ratio = (
+                potential_profit / potential_loss if potential_loss > 0 else "∞"
+            )
 
-                # Continue with existing code...
-                order_price = (
-                    float(buy_order.limit_price)
-                    if buy_order.limit_price
-                    else float(buy_order.filled_avg_price)
-                )
-                order_qty = float(buy_order.qty)
-                filled_qty = float(buy_order.filled_qty) if buy_order.filled_qty else 0
-                remaining_qty = order_qty - filled_qty
-
-                # Calculate the planned exit prices
-                take_profit_price = round(
-                    order_price * (1 + self.take_profit_threshold), 4
-                )
-                stop_loss_price = round(order_price * (1 - self.stop_loss_threshold), 4)
-
-                # Calculate potential profit/loss
-                potential_profit = (take_profit_price - order_price) * order_qty
-                potential_loss = (order_price - stop_loss_price) * order_qty
-
-                # Calculate risk-reward ratio with division by zero protection
-                risk_reward_ratio = (
-                    potential_profit / potential_loss if potential_loss > 0 else "∞"
-                )
-
-                logging.info(
-                    f"\n=== Trading Plan for Order {order_id} ===\n"
-                    f"Status: {buy_order.status}\n"
-                    f"Buy Price: ${order_price:.4f}\n"
-                    f"Quantity: {order_qty:.2f} XRP\n"
-                    f"Filled: {filled_qty:.2f} XRP ({(filled_qty/order_qty*100):.2f}%)\n"
-                    f"Remaining: {remaining_qty:.2f} XRP\n"
-                    f"\nWhen this order fills, the following exit orders will be placed:\n"
-                    f"Take Profit: Sell {order_qty:.2f} XRP @ ${take_profit_price:.4f} (+{self.take_profit_threshold*100:.2f}%)\n"
-                    f"Stop Loss: Sell {order_qty:.2f} XRP @ ${stop_loss_price:.4f} (-{self.stop_loss_threshold*100:.2f}%)\n"
-                    f"\nPotential Profit: ${potential_profit:.2f}\n"
-                    f"Potential Loss: ${potential_loss:.2f}\n"
-                    f"Risk-Reward Ratio: {risk_reward_ratio if isinstance(risk_reward_ratio, str) else f'{risk_reward_ratio:.2f}'}\n"
-                    f"========================================="
-                )
+            logging.info(
+                f"\n=== Trading Plan for Order {order_id} ===\n"
+                f"Status: {buy_order.status}\n"
+                f"Buy Price: ${order_price:.4f}\n"
+                f"Quantity: {order_qty:.2f} XRP\n"
+                f"Filled: {filled_qty:.2f} XRP ({(filled_qty/order_qty*100):.2f}%)\n"
+                f"Remaining: {remaining_qty:.2f} XRP\n"
+                f"\nWhen this order fills, the following exit orders will be placed:\n"
+                f"Take Profit: Sell {order_qty:.2f} XRP @ ${take_profit_price:.4f} (+{self.take_profit_threshold*100:.2f}%)\n"
+                f"Stop Loss: Sell {order_qty:.2f} XRP @ ${stop_loss_price:.4f} (-{self.stop_loss_threshold*100:.2f}%)\n"
+                f"\nPotential Profit: ${potential_profit:.2f}\n"
+                f"Potential Loss: ${potential_loss:.2f}\n"
+                f"Risk-Reward Ratio: {risk_reward_ratio if isinstance(risk_reward_ratio, str) else f'{risk_reward_ratio:.2f}'}\n"
+                f"========================================="
+            )
         except Exception as e:
             logging.error(
                 f"Error displaying trading plan for order {buy_order.id}: {e}"
@@ -1925,105 +1874,18 @@ class XRPStreamer:
         except Exception as e:
             logging.error(f"Error in check_and_set_orders: {e}")
 
-    def store_order(self, order, fees=0):
-        """Store order details in database with retry logic and duplicate handling"""
-        retries = 0
-        max_retries = self.max_retries
-
-        while retries < max_retries:
-            try:
-                with self.engine.connect() as conn:
-                    # Check if order already exists to avoid duplicates
-                    existing_order = conn.execute(
-                        sqlalchemy.select(self.orders.c.order_id).where(
-                            self.orders.c.order_id == order.id
-                        )
-                    ).fetchone()
-
-                    if existing_order:
-                        # Update existing order instead of inserting
-                        conn.execute(
-                            self.orders.update()
-                            .where(self.orders.c.order_id == order.id)
-                            .values(
-                                timestamp=datetime.now(),
-                                side=order.side,
-                                quantity=float(order.qty) if order.qty else 0,
-                                price=(
-                                    float(order.limit_price) if order.limit_price else 0
-                                ),
-                                status=order.status,
-                                filled_qty=(
-                                    float(order.filled_qty) if order.filled_qty else 0
-                                ),
-                                filled_avg_price=(
-                                    float(order.filled_avg_price)
-                                    if order.filled_avg_price
-                                    else 0
-                                ),
-                                fees=fees,
-                            )
-                        )
-                    else:
-                        # Insert new order
-                        conn.execute(
-                            self.orders.insert().values(
-                                order_id=order.id,
-                                timestamp=datetime.now(),
-                                side=order.side,
-                                quantity=float(order.qty) if order.qty else 0,
-                                price=(
-                                    float(order.limit_price) if order.limit_price else 0
-                                ),
-                                status=order.status,
-                                filled_qty=(
-                                    float(order.filled_qty) if order.filled_qty else 0
-                                ),
-                                filled_avg_price=(
-                                    float(order.filled_avg_price)
-                                    if order.filled_avg_price
-                                    else 0
-                                ),
-                                fees=fees,
-                            )
-                        )
-                    conn.commit()
-                    return True
-            except Exception as e:
-                retries += 1
-                logging.error(
-                    f"Error storing order (attempt {retries}/{max_retries}): {e}"
-                )
-                if retries >= max_retries:
-                    return False
-                time.sleep(self.retry_delay)
-        return False
-
-    def _log_trading_status(self, position=None, orders=None):
+    def _log_trading_status(self):
         """Log detailed trading status"""
         try:
             logging.info("\n=== Detailed Position & Order Status ===")
 
-            # Get current position if not provided
-            if not position:
-                try:
-                    positions = self.trading_client.get_all_positions()
-                    for pos in positions:
-                        if pos.symbol == "XRP/USD":
-                            position = pos
-                            break
-                except Exception as e:
-                    logging.error(
-                        f"Error getting positions in _log_trading_status: {e}"
-                    )
-
-            # Get all orders if not provided
-            if not orders:
-                try:
-                    orders = self.trading_client.get_orders()
-                except Exception as e:
-                    logging.error(f"Error getting orders in _log_trading_status: {e}")
-                    orders = []
+            # Get current position
+            positions = self.trading_client.get_all_positions()
+            position = None
+            for pos in positions:
+                if pos.symbol == "XRP/USD":
+                    position = pos
+                    break
 
             if position:
                 entry_price = float(position.avg_entry_price)
@@ -2041,6 +1903,9 @@ class XRPStreamer:
                 )
             else:
                 logging.info("\nNo Active Position")
+
+            # Get all orders
+            orders = self.trading_client.get_orders()
 
             if orders:
                 logging.info("\nActive Orders:")
