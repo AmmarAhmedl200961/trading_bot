@@ -4,3 +4,4 @@ sqlalchemy
 python-dotenv
 pytz
 psycopg2
+pandas-ta
