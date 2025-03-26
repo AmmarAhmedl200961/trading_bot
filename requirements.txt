@@ -3,3 +3,4 @@ websockets
 sqlalchemy
 python-dotenv
 pytz
+psycopg2
