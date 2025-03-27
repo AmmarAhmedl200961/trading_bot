@@ -4,6 +4,7 @@ import json
 import websockets
 from datetime import datetime, timedelta
 import pytz
+import time
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -577,15 +578,59 @@ class XRPStreamer:
     async def place_exit_orders(self, filled_price, filled_qty, order_id):
         """Place take profit and trailing stop orders after a buy order is filled"""
         try:
-            # Wait a bit longer for the position to be reflected in the system
-            await asyncio.sleep(5)  # Increased from 2 seconds
+            # Wait longer for the position to be reflected in the system
+            await asyncio.sleep(10)  # Increased from 5 seconds to 10 seconds
 
             # Get current position to verify available quantity
             max_retries = 5
-            retry_delay = 3  # Increased initial delay
+            retry_delay = 3
             available_qty = 0
             position_found = False
 
+            # First, check if there are any existing sell orders for this symbol
+            # and cancel them to prevent "wash trade" errors
+            try:
+                orders = self.trading_client.get_orders()
+                existing_sell_orders = [
+                    o for o in orders if o.symbol == "XRP/USD" and o.side == "sell"
+                ]
+
+                if existing_sell_orders:
+                    logging.info(
+                        f"Found {len(existing_sell_orders)} existing sell orders. Cancelling them to prevent wash trade errors."
+                    )
+                    for order in existing_sell_orders:
+                        try:
+                            self.trading_client.cancel_order_by_id(order.id)
+                            logging.info(f"Successfully cancelled order {order.id}")
+                            await asyncio.sleep(1)  # Brief pause between cancellations
+                        except Exception as e:
+                            logging.warning(f"Failed to cancel order {order.id}: {e}")
+
+                # Also check for and cancel any pending buy orders that might conflict
+                existing_buy_orders = [
+                    o
+                    for o in orders
+                    if o.symbol == "XRP/USD" and o.side == "buy" and o.id != order_id
+                ]
+
+                if existing_buy_orders:
+                    logging.info(
+                        f"Found {len(existing_buy_orders)} existing buy orders. Cancelling them to prevent conflicts."
+                    )
+                    for order in existing_buy_orders:
+                        try:
+                            self.trading_client.cancel_order_by_id(order.id)
+                            logging.info(f"Successfully cancelled buy order {order.id}")
+                            await asyncio.sleep(1)  # Brief pause between cancellations
+                        except Exception as e:
+                            logging.warning(
+                                f"Failed to cancel buy order {order.id}: {e}"
+                            )
+            except Exception as e:
+                logging.error(f"Error managing existing orders: {e}")
+
+            # Now proceed to check positions
             for retry in range(max_retries):
                 positions = self.trading_client.get_all_positions()
                 position = None
@@ -607,32 +652,37 @@ class XRPStreamer:
                             f"Position not found or zero quantity on attempt {retry+1}, retrying in {retry_delay} seconds..."
                         )
                         await asyncio.sleep(retry_delay)
-                        retry_delay *= 1.5  # Exponential backoff with slower increase
+                        retry_delay *= 1.5
 
-            # If we haven't found a position after all retries, use the filled quantity directly
+            # If no position found, try alternative approaches
             if not position_found:
                 logging.warning(
-                    "Position not found after maximum retries. Checking account balance for XRP..."
+                    "Position not found after maximum retries. Checking account balances..."
                 )
-                # Try to get actual XRP balance from account
+
+                # Try to get actual XRP balance by checking positions with different symbols
                 try:
-                    account_info = self.trading_client.get_account()
-                    # Check if there's a method to get cryptocurrency balances
                     all_positions = self.trading_client.get_all_positions()
 
-                    # Log what we found
-                    logging.info(f"Account status: {account_info.status}")
-                    logging.info(f"Found {len(all_positions)} positions")
+                    # Log all positions for debugging
+                    for pos in all_positions:
+                        logging.info(
+                            f"Found position: Symbol={pos.symbol}, Qty={pos.qty}, Value=${pos.market_value}"
+                        )
 
-                    # Use a smaller quantity than the filled quantity to account for potential fees
-                    available_qty = filled_qty * 0.99  # Use 99% of filled quantity
-                    logging.info(f"Using 99% of filled quantity: {available_qty} XRP")
+                    # Check account info for crypto balances
+                    account_info = self.trading_client.get_account()
+                    logging.info(f"Account status: {account_info.status}")
+
+                    # For crypto, we need to use a more conservative estimate
+                    available_qty = filled_qty * 0.95  # Use 95% of filled quantity
+                    logging.info(f"Using 95% of filled quantity: {available_qty} XRP")
                 except Exception as e:
-                    logging.error(f"Error getting account balance: {e}")
-                    # Use a more conservative estimate
-                    available_qty = filled_qty * 0.98  # Use 98% of filled quantity
+                    logging.error(f"Error getting account balances: {e}")
+                    # Even more conservative fallback
+                    available_qty = filled_qty * 0.90  # Use 90% of filled quantity
                     logging.warning(
-                        f"Using 98% of filled quantity as fallback: {available_qty} XRP"
+                        f"Using 90% of filled quantity as fallback: {available_qty} XRP"
                     )
 
             # Ensure we have a valid quantity and round appropriately
@@ -645,74 +695,19 @@ class XRPStreamer:
                 take_profit_threshold = thresholds["take_profit"]
                 stop_loss_threshold = thresholds["stop_loss"]
 
-                # Place take profit order
-                take_profit_price = round(filled_price * (1 + take_profit_threshold), 4)
-                try:
-                    tp_order = self.trading_client.submit_order(
-                        LimitOrderRequest(
-                            symbol="XRP/USD",
-                            qty=str(available_qty),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            limit_price=str(take_profit_price),
-                        )
-                    )
-                    self.active_orders["take_profit"] = tp_order.id
-                    self.store_order(tp_order)
-                    logging.info(
-                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
-                    )
-                except Exception as e:
-                    logging.error(f"Error placing take profit order: {e}")
-                    if "insufficient balance" in str(e).lower():
-                        # Try with a smaller quantity
-                        reduced_qty = round(available_qty * 0.98, 1)  # Try with 98%
-                        logging.info(
-                            f"Retrying with reduced quantity: {reduced_qty} XRP"
-                        )
-                        try:
-                            tp_order = self.trading_client.submit_order(
-                                LimitOrderRequest(
-                                    symbol="XRP/USD",
-                                    qty=str(reduced_qty),
-                                    side=OrderSide.SELL,
-                                    time_in_force=TimeInForce.GTC,
-                                    limit_price=str(take_profit_price),
-                                )
-                            )
-                            self.active_orders["take_profit"] = tp_order.id
-                            self.store_order(tp_order)
-                            logging.info(
-                                f"Take profit order placed with reduced quantity: {reduced_qty} XRP @ ${take_profit_price:.4f}"
-                            )
-                            available_qty = reduced_qty  # Update available quantity for stop loss order
-                        except Exception as e2:
-                            logging.error(
-                                f"Error placing take profit order with reduced quantity: {e2}"
-                            )
+                # Try different approaches with smaller quantities to avoid insufficient balance errors
+                success = await self._place_take_profit_order(
+                    filled_price, available_qty, take_profit_threshold
+                )
 
-                # Place stop order instead of trailing stop (trailing stop not supported for crypto)
-                stop_loss_price = round(filled_price * (1 - stop_loss_threshold), 4)
-                try:
-                    sl_order = self.trading_client.submit_order(
-                        StopOrderRequest(  # Use StopOrderRequest instead of TrailingStopOrderRequest
-                            symbol="XRP/USD",
-                            qty=str(available_qty),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            stop_price=str(stop_loss_price),
-                        )
-                    )
-                    self.active_orders["stop_loss"] = sl_order.id
-                    self.store_order(sl_order)
-                    logging.info(
-                        f"Stop loss order placed: {available_qty} XRP @ ${stop_loss_price:.4f} (-{stop_loss_threshold*100:.2f}%)"
-                    )
-                except Exception as e:
-                    logging.error(f"Error placing stop order: {e}")
-                    # Fallback to regular stop limit if stop order fails
-                    self._place_fallback_stop_loss(
+                if success:
+                    # Place stop limit order with appropriate parameters for crypto
+                    await self._place_stop_limit_order(
                         filled_price, available_qty, stop_loss_threshold
+                    )
+                else:
+                    logging.error(
+                        f"Failed to place take profit order after multiple attempts"
                     )
             else:
                 logging.error(
@@ -721,6 +716,105 @@ class XRPStreamer:
 
         except Exception as e:
             logging.error(f"Error in place_exit_orders: {e}")
+
+    async def _place_take_profit_order(
+        self, filled_price, available_qty, take_profit_threshold
+    ):
+        """Helper method to place take profit order with multiple fallback attempts"""
+        # Start with the full quantity
+        current_qty = available_qty
+        take_profit_price = round(filled_price * (1 + take_profit_threshold), 4)
+
+        # Try up to 3 times with reducing quantity
+        for attempt in range(3):
+            try:
+                qty_to_use = round(
+                    current_qty * (1 - attempt * 0.1), 1
+                )  # Reduce by 10% each attempt
+                if qty_to_use <= 0:
+                    return False
+
+                logging.info(
+                    f"Placing take profit order attempt {attempt+1}: {qty_to_use} XRP @ ${take_profit_price:.4f}"
+                )
+
+                tp_order = self.trading_client.submit_order(
+                    LimitOrderRequest(
+                        symbol="XRP/USD",
+                        qty=str(qty_to_use),
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        limit_price=str(take_profit_price),
+                    )
+                )
+                self.active_orders["take_profit"] = tp_order.id
+                self.store_order(tp_order)
+                logging.info(
+                    f"Take profit order placed: {qty_to_use} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
+                )
+                return True
+
+            except Exception as e:
+                logging.warning(
+                    f"Error placing take profit order (attempt {attempt+1}): {e}"
+                )
+                # Wait briefly before retrying
+                await asyncio.sleep(1)
+
+        return False
+
+    async def _place_stop_limit_order(
+        self, filled_price, available_qty, stop_loss_threshold
+    ):
+        """Helper method to place stop limit order with proper parameters for crypto"""
+        stop_loss_price = round(filled_price * (1 - stop_loss_threshold), 4)
+        limit_price = round(
+            stop_loss_price * 0.995, 4
+        )  # Slightly lower to ensure execution
+
+        try:
+            # For crypto, use StopLimitOrderRequest instead of StopOrderRequest
+            sl_order = self.trading_client.submit_order(
+                StopLimitOrderRequest(
+                    symbol="XRP/USD",
+                    qty=str(available_qty),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=str(stop_loss_price),
+                    limit_price=str(limit_price),
+                )
+            )
+            self.active_orders["stop_loss"] = sl_order.id
+            self.store_order(sl_order)
+            logging.info(
+                f"Stop limit order placed: {available_qty} XRP @ stop ${stop_loss_price:.4f}, limit ${limit_price:.4f} (-{stop_loss_threshold*100:.2f}%)"
+            )
+            return True
+        except Exception as e:
+            logging.error(f"Error placing stop limit order: {e}")
+
+            # Try with reduced quantity
+            try:
+                reduced_qty = round(available_qty * 0.95, 1)
+                sl_order = self.trading_client.submit_order(
+                    StopLimitOrderRequest(
+                        symbol="XRP/USD",
+                        qty=str(reduced_qty),
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=str(stop_loss_price),
+                        limit_price=str(limit_price),
+                    )
+                )
+                self.active_orders["stop_loss"] = sl_order.id
+                self.store_order(sl_order)
+                logging.info(
+                    f"Stop limit order placed with reduced quantity: {reduced_qty} XRP @ ${stop_loss_price:.4f}"
+                )
+                return True
+            except Exception as e2:
+                logging.error(f"Error placing reduced stop limit order: {e2}")
+                return False
 
     def _place_fallback_stop_loss(
         self, filled_price, available_qty, stop_loss_threshold
@@ -732,11 +826,33 @@ class XRPStreamer:
             stop_loss_price = round(filled_price * (1 - stop_loss_threshold), 4)
             limit_price = round(stop_loss_price * 0.995, 4)
 
+            # Cancel any existing stop orders to avoid wash trade errors
+            try:
+                orders = self.trading_client.get_orders()
+                existing_stop_orders = [
+                    o
+                    for o in orders
+                    if o.symbol == "XRP/USD"
+                    and o.side == "sell"
+                    and (o.type == "stop" or o.type == "stop_limit")
+                ]
+
+                for order in existing_stop_orders:
+                    self.trading_client.cancel_order_by_id(order.id)
+                    logging.info(f"Cancelled existing stop order {order.id}")
+                    # Brief pause after cancellation
+                    time.sleep(0.5)
+            except Exception as e:
+                logging.warning(f"Error cancelling existing stop orders: {e}")
+
+            # Try with slightly reduced quantity first
+            reduced_qty = round(available_qty * 0.95, 1)  # Use 95% of available
+
             try:
                 sl_order = self.trading_client.submit_order(
                     StopLimitOrderRequest(
                         symbol="XRP/USD",
-                        qty=str(available_qty),
+                        qty=str(reduced_qty),
                         side=OrderSide.SELL,
                         time_in_force=TimeInForce.GTC,
                         stop_price=str(stop_loss_price),
@@ -746,53 +862,42 @@ class XRPStreamer:
                 self.active_orders["stop_loss"] = sl_order.id
                 self.store_order(sl_order)
                 logging.info(
-                    f"Fallback stop loss order placed: {available_qty} XRP @ ${stop_loss_price:.4f} (-{stop_loss_threshold*100:.2f}%)"
+                    f"Fallback stop loss order placed: {reduced_qty} XRP @ ${stop_loss_price:.4f} (-{stop_loss_threshold*100:.2f}%)"
                 )
+                return True
             except Exception as e:
-                if "insufficient balance" in str(e).lower():
-                    # Try with a smaller quantity
-                    reduced_qty = round(available_qty * 0.98, 1)  # Try with 98%
-                    logging.info(
-                        f"Retrying stop loss with reduced quantity: {reduced_qty} XRP"
-                    )
-                    sl_order = self.trading_client.submit_order(
-                        StopLimitOrderRequest(
-                            symbol="XRP/USD",
-                            qty=str(reduced_qty),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            stop_price=str(stop_loss_price),
-                            limit_price=str(limit_price),
-                        )
-                    )
-                    self.active_orders["stop_loss"] = sl_order.id
-                    self.store_order(sl_order)
-                    logging.info(
-                        f"Fallback stop loss placed with reduced quantity: {reduced_qty} XRP @ ${stop_loss_price:.4f}"
-                    )
-                else:
-                    logging.error(f"Error placing fallback stop loss: {e}")
-                    # Last resort - try market order
+                logging.error(f"Error placing fallback stop loss: {e}")
+
+                # If there's a wash trade error, try placing a limit order at a price well below current market
+                if "wash trade" in str(e).lower():
                     try:
-                        market_sl_order = self.trading_client.submit_order(
-                            MarketOrderRequest(
+                        emergency_price = round(
+                            filled_price * 0.9, 4
+                        )  # 10% below filled price
+                        emergency_order = self.trading_client.submit_order(
+                            LimitOrderRequest(
                                 symbol="XRP/USD",
                                 qty=str(
-                                    round(available_qty * 0.97, 1)
-                                ),  # Even more reduced
+                                    round(reduced_qty * 0.9, 1)
+                                ),  # Further reduce quantity
                                 side=OrderSide.SELL,
                                 time_in_force=TimeInForce.GTC,
+                                limit_price=str(emergency_price),
                             )
                         )
                         logging.info(
-                            f"Emergency market stop loss placed: {round(available_qty * 0.97, 1)} XRP"
+                            f"Emergency limit sell order placed: {round(reduced_qty * 0.9, 1)} XRP @ ${emergency_price:.4f}"
                         )
-                        self.active_orders["stop_loss"] = market_sl_order.id
-                        self.store_order(market_sl_order)
+                        self.active_orders["stop_loss"] = emergency_order.id
+                        self.store_order(emergency_order)
+                        return True
                     except Exception as e2:
-                        logging.error(f"Failed to place market stop loss: {e2}")
+                        logging.error(f"Failed to place emergency limit order: {e2}")
+                        return False
+                return False
         except Exception as e:
             logging.error(f"Error in fallback stop loss placement: {e}")
+            return False
 
     async def ensure_exit_orders(self, position, current_price):
         """Ensure take profit and trailing stop orders exist for an open position"""
@@ -820,7 +925,9 @@ class XRPStreamer:
             has_sl_order = any(
                 o.symbol == "XRP/USD"
                 and o.side == "sell"
-                and (o.type == "stop" or o.type == "stop_limit")
+                and (
+                    o.type == "stop_limit"
+                )  # Changed from o.type == "stop" or o.type == "stop_limit"
                 for o in orders
             )
 
@@ -831,73 +938,15 @@ class XRPStreamer:
 
             # Place take profit order if needed
             if not has_tp_order:
-                take_profit_price = round(entry_price * (1 + take_profit_threshold), 4)
-                try:
-                    tp_order = self.trading_client.submit_order(
-                        LimitOrderRequest(
-                            symbol="XRP/USD",
-                            qty=str(available_qty),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            limit_price=str(take_profit_price),
-                        )
-                    )
-                    self.active_orders["take_profit"] = tp_order.id
-                    self.store_order(tp_order)
-                    logging.info(
-                        f"Take profit order placed: {available_qty} XRP @ ${take_profit_price:.4f} (+{take_profit_threshold*100:.2f}%)"
-                    )
-                except Exception as e:
-                    logging.error(f"Error placing take profit order: {e}")
-                    if "insufficient balance" in str(e).lower():
-                        # Try with 98% of available quantity
-                        try:
-                            reduced_qty = round(available_qty * 0.98, 1)
-                            tp_order = self.trading_client.submit_order(
-                                LimitOrderRequest(
-                                    symbol="XRP/USD",
-                                    qty=str(reduced_qty),
-                                    side=OrderSide.SELL,
-                                    time_in_force=TimeInForce.GTC,
-                                    limit_price=str(take_profit_price),
-                                )
-                            )
-                            self.active_orders["take_profit"] = tp_order.id
-                            self.store_order(tp_order)
-                            logging.info(
-                                f"Take profit placed with reduced quantity: {reduced_qty} XRP @ ${take_profit_price:.4f}"
-                            )
-                            # Update available_qty for the stop loss order to match
-                            available_qty = reduced_qty
-                        except Exception as e2:
-                            logging.error(
-                                f"Error placing take profit with reduced quantity: {e2}"
-                            )
+                await self._place_take_profit_order(
+                    entry_price, available_qty, take_profit_threshold
+                )
 
-            # Place stop order if needed (since trailing stop is not supported for crypto)
+            # Place stop limit order if needed (NOT using StopOrderRequest which is invalid for crypto)
             if not has_sl_order:
-                stop_loss_price = round(entry_price * (1 - stop_loss_threshold), 4)
-                try:
-                    sl_order = self.trading_client.submit_order(
-                        StopOrderRequest(  # Use StopOrderRequest instead of TrailingStopOrderRequest
-                            symbol="XRP/USD",
-                            qty=str(available_qty),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            stop_price=str(stop_loss_price),
-                        )
-                    )
-                    self.active_orders["stop_loss"] = sl_order.id
-                    self.store_order(sl_order)
-                    logging.info(
-                        f"Stop loss order placed: {available_qty} XRP with stop price ${stop_loss_price:.4f}"
-                    )
-                except Exception as e:
-                    logging.error(f"Error placing stop order: {e}")
-                    # Fallback to regular stop loss
-                    self._place_fallback_stop_loss(
-                        entry_price, available_qty, stop_loss_threshold
-                    )
+                await self._place_stop_limit_order(
+                    entry_price, available_qty, stop_loss_threshold
+                )
 
         except Exception as e:
             logging.error(f"Error ensuring exit orders: {e}")
