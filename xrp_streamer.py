@@ -893,6 +893,274 @@ class XRPStreamer:
         except Exception as e:
             logging.error(f"Error processing message: {e}")
 
+    async def initialize_orders(self):
+        """Initialize orders on startup without canceling positions"""
+        try:
+            position = await self.get_position()
+            current_price = self.get_last_price()
+
+            if not current_price:
+                logging.error("No price data available")
+                return
+
+            logging.info("Initializing orders for existing positions...")
+
+            # Get existing orders WITHOUT canceling them
+            orders = self.trading_client.get_orders()
+            has_buy_order = any(o.side == "buy" for o in orders)
+            has_tp_order = any(o.side == "sell" and o.type == "limit" for o in orders)
+            has_sl_order = any(
+                o.side == "sell" and o.type == "stop_limit" for o in orders
+            )
+
+            logging.info(f"Found {len(orders)} existing orders")
+            logging.info(f"Buy orders: {'Yes' if has_buy_order else 'No'}")
+            logging.info(f"Take profit orders: {'Yes' if has_tp_order else 'No'}")
+            logging.info(f"Stop loss orders: {'Yes' if has_sl_order else 'No'}")
+
+            if position:
+                logging.info(f"Found existing position: {position.qty} XRP")
+                entry_price = float(position.avg_entry_price)
+                available_qty = float(position.qty_available)
+
+                # Only add missing orders, don't cancel existing ones
+                if available_qty > 0:
+                    take_profit_price = round(entry_price * (1 + self.take_profit_threshold), 4)
+                    stop_loss_price = round(entry_price * (1 - self.stop_loss_threshold), 4)
+
+                    if not has_tp_order:
+                        try:
+                            tp_order = self.trading_client.submit_order(
+                                LimitOrderRequest(
+                                    symbol="XRP/USD",
+                                    qty=str(available_qty),
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.GTC,
+                                    limit_price=str(take_profit_price),
+                                )
+                            )
+                            self.active_orders["take_profit"] = tp_order.id
+                            self.store_order(tp_order)
+                            logging.info(
+                                f"Added take profit order at ${take_profit_price:.4f} (+3.5%)"
+                            )
+                        except Exception as e:
+                            logging.error(f"Error placing take profit order: {e}")
+
+                    if not has_sl_order:
+                        try:
+                            sl_order = self.trading_client.submit_order(
+                                StopLimitOrderRequest(
+                                    symbol="XRP/USD",
+                                    qty=str(available_qty),
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.GTC,
+                                    stop_price=str(stop_loss_price),
+                                    limit_price=str(round(stop_loss_price * 0.995, 4)),
+                                )
+                            )
+                            self.active_orders["stop_loss"] = sl_order.id
+                            self.store_order(sl_order)
+                            logging.info(
+                                f"Added stop loss order at ${stop_loss_price:.4f} (-1.5%)"
+                            )
+                        except Exception as e:
+                            logging.error(f"Error placing stop loss order: {e}")
+                else:
+                    logging.info(f"Position found but no available quantity to place orders")
+            else:
+                # Only place buy order if no position and no existing buy order
+                logging.info("No existing position found")
+                if not has_buy_order and self.cash_balance >= self.min_position_value:
+                    logging.info("Placing initial buy order...")
+                    await self.place_buy_order(current_price)
+                elif self.cash_balance < self.min_position_value:
+                    logging.warning(f"Insufficient funds for initial position. Required: ${self.min_position_value}, Available: ${self.cash_balance}")
+
+            # Log current status
+            await self._log_trading_status()
+        except Exception as e:
+            logging.error(f"Error initializing orders: {e}")
+            # Don't raise the exception to allow the program to continue
+
+    async def _log_trading_status(self):
+        """Log detailed trading status"""
+        try:
+            logging.info("\n=== Detailed Position & Order Status ===")
+
+            # Get current position
+            positions = self.trading_client.get_all_positions()
+            position = None
+            for pos in positions:
+                if pos.symbol == "XRP/USD":
+                    position = pos
+                    break
+
+            if position:
+                entry_price = float(position.avg_entry_price)
+                qty = float(position.qty)
+                market_value = float(position.market_value)
+                unrealized_pl = float(position.unrealized_pl)
+                unrealized_plpc = float(position.unrealized_plpc)
+
+                logging.info(f"\nActive Position:")
+                logging.info(f"  Entry Price: ${entry_price:.4f}")
+                logging.info(f"  Current Quantity: {qty} XRP")
+                logging.info(f"  Market Value: ${market_value:.2f}")
+                logging.info(
+                    f"  Unrealized P/L: ${unrealized_pl:.2f} ({unrealized_plpc:.2%})"
+                )
+            else:
+                logging.info("\nNo Active Position")
+
+            # Get all orders
+            orders = self.trading_client.get_orders()
+
+            if orders:
+                logging.info("\nActive Orders:")
+                for order in orders:
+                    order_type = "Buy Order" if order.side == "buy" else "Sell Order"
+                    price = (
+                        float(order.limit_price)
+                        if hasattr(order, "limit_price") and order.limit_price
+                        else 0
+                    )
+                    qty = float(order.qty)
+                    filled = float(order.filled_qty) if order.filled_qty else 0
+
+                    logging.info(
+                        f"{order_type}:\n"
+                        f"  Status: {order.status}\n"
+                        f"  Price: ${price:.4f}\n"
+                        f"  Quantity: {qty} XRP\n"
+                        f"  Filled: {filled} XRP"
+                    )
+            else:
+                logging.info("\nNo Active Orders")
+
+            # Get account info
+            account = self.trading_client.get_account()
+            self.cash_balance = float(account.cash)
+            buying_power = float(account.buying_power)
+
+            logging.info(f"\nAccount Status:")
+            logging.info(f"Cash Balance: ${self.cash_balance:.2f}")
+            logging.info(f"Buying Power: ${buying_power:.2f}")
+            logging.info("=" * 40)
+
+        except Exception as e:
+            logging.error(f"Error logging trading status: {e}")
+
+    async def ensure_exit_orders(self, position, current_price):
+        """Ensure that exit orders (take profit and stop loss) exist for a position"""
+        try:
+            # Get existing orders
+            orders = self.trading_client.get_orders()
+            has_tp_order = any(
+                o.symbol == "XRP/USD" and o.side == "sell" and o.type == "limit"
+                for o in orders
+            )
+            has_sl_order = any(
+                o.symbol == "XRP/USD" and o.side == "sell" and o.type == "stop_limit"
+                for o in orders
+            )
+            
+            # Skip if both orders already exist
+            if has_tp_order and has_sl_order:
+                return
+                
+            # Get position details
+            available_qty = float(position.qty_available)
+            entry_price = float(position.avg_entry_price)
+            
+            if available_qty <= 0:
+                logging.info("No available quantity to place exit orders")
+                return
+                
+            # Place take profit order if missing
+            if not has_tp_order:
+                take_profit_price = round(entry_price * (1 + self.take_profit_threshold), 4)
+                try:
+                    tp_order = self.trading_client.submit_order(
+                        LimitOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            limit_price=str(take_profit_price),
+                        )
+                    )
+                    self.active_orders["take_profit"] = tp_order.id
+                    self.store_order(tp_order)
+                    logging.info(f"Added take profit order: {available_qty} XRP @ ${take_profit_price:.4f}")
+                except Exception as e:
+                    logging.error(f"Error placing take profit order: {e}")
+                    
+            # Place stop loss order if missing
+            if not has_sl_order:
+                stop_loss_price = round(entry_price * (1 - self.stop_loss_threshold), 4)
+                limit_price = round(stop_loss_price * 0.995, 4)
+                try:
+                    sl_order = self.trading_client.submit_order(
+                        StopLimitOrderRequest(
+                            symbol="XRP/USD",
+                            qty=str(available_qty),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            stop_price=str(stop_loss_price),
+                            limit_price=str(limit_price),
+                        )
+                    )
+                    self.active_orders["stop_loss"] = sl_order.id
+                    self.store_order(sl_order)
+                    logging.info(f"Added stop loss order: {available_qty} XRP @ ${stop_loss_price:.4f}")
+                except Exception as e:
+                    logging.error(f"Error placing stop loss order: {e}")
+                    
+        except Exception as e:
+            logging.error(f"Error ensuring exit orders: {e}")
+
+    async def check_trading_conditions(self, current_price):
+        """Enhanced trading conditions check"""
+        try:
+            position = await self.get_position()
+            orders = self.trading_client.get_orders()
+
+            # No position case - ensure buy order exists
+            if not position:
+                has_buy_order = any(
+                    o.symbol == "XRP/USD" and o.side == "buy" for o in orders
+                )
+
+                if not has_buy_order and self.cash_balance >= self.position_value:
+                    # Place new buy order
+                    buy_order = await self.place_buy_order(current_price)
+                    if buy_order:
+                        self.active_orders["buy"] = buy_order.id
+                    return True
+
+            # Position exists - ensure exit orders are in place
+            else:
+                has_tp_order = any(
+                    o.symbol == "XRP/USD" and o.side == "sell" and o.type == "limit"
+                    for o in orders
+                )
+                has_sl_order = any(
+                    o.symbol == "XRP/USD"
+                    and o.side == "sell"
+                    and o.type == "stop_limit"
+                    for o in orders
+                )
+
+                if not (has_tp_order and has_sl_order):
+                    await self.ensure_exit_orders(position, current_price)
+
+            return False
+
+        except Exception as e:
+            logging.error(f"Error in trading conditions check: {e}")
+            return False
+
 
 async def main():
     streamer = XRPStreamer()
