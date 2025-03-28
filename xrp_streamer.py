@@ -429,6 +429,97 @@ class XRPStreamer:
             logging.error(f"Error connecting to WebSocket: {e}")
             return False
 
+    def update_account_balance(self):
+        """Update the current cash balance"""
+        try:
+            account = self.trading_client.get_account()
+            self.cash_balance = min(float(account.cash), float(account.buying_power))
+            return self.cash_balance
+        except Exception as e:
+            logging.error(f"Error updating account balance: {e}")
+            self.cash_balance = 0.0
+            return 0.0
+
+    async def calculate_fees(self, trade_amount_usd, current_price):
+        """Calculate total fees for a trade"""
+        trading_fee = trade_amount_usd * self.trading_fee_pct  # 1.6% trading fee
+        network_fee_usd = self.network_fee_xrp * current_price  # XRP network fee
+        total_fees = trading_fee + network_fee_usd
+        return total_fees
+
+    async def stream(self):
+        """Main streaming loop"""
+        try:
+            # Connect to WebSocket
+            connected = await self.connect()
+            if not connected:
+                logging.error("Failed to connect to WebSocket. Retrying...")
+                await asyncio.sleep(self.ws_reconnect_delay)
+                self.ws_reconnect_delay = min(
+                    self.ws_reconnect_delay * 2, self.ws_max_reconnect_delay
+                )
+                self.ws_reconnect_attempts += 1
+                await self.stream()
+                return
+
+            # Reset reconnect parameters on successful connection
+            self.ws_reconnect_delay = 5
+            self.ws_reconnect_attempts = 0
+            self.ws_last_heartbeat = datetime.now()
+
+            # Main WebSocket loop
+            while self.ws and self.connected:
+                try:
+                    message = await asyncio.wait_for(self.ws.recv(), timeout=30)
+                    await self.process_message(json.loads(message))
+                    self.ws_last_heartbeat = (
+                        datetime.now()
+                    )  # Update heartbeat timestamp on successful message
+
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    try:
+                        logging.info("Connection idle, sending ping...")
+                        pong = await self.ws.ping()
+                        await asyncio.wait_for(pong, timeout=10)
+                        logging.debug("Ping successful, connection still alive")
+                        self.ws_last_heartbeat = datetime.now()
+                    except Exception as e:
+                        logging.warning(f"Ping failed: {e}, reconnecting...")
+                        self.connected = False
+                        break
+
+                except websockets.exceptions.ConnectionClosed as e:
+                    logging.error(f"WebSocket connection closed: {e}")
+                    self.connected = False
+                    break
+
+                except Exception as e:
+                    logging.error(f"Error in WebSocket loop: {e}")
+                    if "no close frame received or sent" in str(e):
+                        logging.info(
+                            "Detected WebSocket close frame issue, reconnecting..."
+                        )
+                        self.connected = False
+                        break
+                    await asyncio.sleep(1)
+
+        except Exception as e:
+            logging.error(f"Critical error in stream: {e}")
+
+        finally:
+            # Try to reconnect if connection was lost
+            if not self.connected:
+                logging.info(
+                    f"Reconnecting in {self.ws_reconnect_delay} seconds... (Attempt {self.ws_reconnect_attempts + 1})"
+                )
+                await asyncio.sleep(self.ws_reconnect_delay)
+                self.ws_reconnect_delay = min(
+                    self.ws_reconnect_delay * 2, self.ws_max_reconnect_delay
+                )
+                self.ws_reconnect_attempts += 1
+                await self.stream()
+
 
 async def main():
     streamer = XRPStreamer()
